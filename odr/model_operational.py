@@ -398,15 +398,14 @@ class OperationalNetwork(object):
             if True, data is shuffled before batches are created
         """
         if type(data) is Dataset:
-            data = [np.array(data.input_data),
-                    np.array(data.questions),
-                    np.array(data.answers)]
+            data = [data.input_data,
+                    data.questions,
+                    data.answers]
         if shuffle:
             p = np.random.permutation(len(data[0]))
-            data = [data[i][p] for i in [0, 1, 2]]
+            data = [[data[i][j] for j in p] for i in [0, 1, 2]]
         for i in range(int(len(data[0]) / batch_size)):
-            batch_slice = slice(i * batch_size, (i + 1) * batch_size)
-            batch = [data[j][batch_slice] for j in [0, 1, 2]]
+            batch = [[data[j][i] for i in range(i * batch_size,(i + 1) * batch_size)] for j in [0, 1, 2]]
             yield self.gen_data_dict(batch)
 
     def gen_data_dict(self, data):
@@ -419,14 +418,14 @@ class OperationalNetwork(object):
         """
         data_dict = {}
         if type(data) is Dataset:
-            data = [np.array(data.input_data),
-                    np.array(data.questions),
-                    np.array(data.answers)]
+            data = [data.input_data,
+                    data.questions,
+                    data.answers]
         for k in range(self.encoder_num):
-            data_dict[self.inputs[k]] = data[0][:, k]
+            data_dict[self.inputs[k]] = np.array([data[0][i][k] for i in range(len(data[0]))])
             for n in range(self.decoder_num):
-                data_dict[self.question_inputs[n]] = data[1][:, n]
-                data_dict[self.answers[n]] = data[2][:, n]
+                data_dict[self.question_inputs[n]] = np.array([data[1][i][n] for i in range(len(data[1]))])
+                data_dict[self.answers[n]] = np.array([data[2][i][n] for i in range(len(data[2]))])
                 data_dict[self.select_noise[n]] = np.random.normal(size=[len(data[0]), self.total_latent_size])
 
         return data_dict
