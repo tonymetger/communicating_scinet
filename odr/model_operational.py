@@ -86,7 +86,7 @@ class OperationalNetwork(object):
     #########################################
 
     def train(self, epoch_num, batch_size, learning_rate, training_data, validation_data,
-              reg_loss_factor=0., gamma=0.01, pretrain=False, nloc_factor=1.,
+              reg_loss_factor=0., gamma1=0.01, gamma2=0.01, pretrain=False, nloc_factor=1.,
               test_step=None, progress_bar=lambda x: x, add_feeds={}):
         """
         Trains the network.
@@ -129,7 +129,7 @@ class OperationalNetwork(object):
                 for step, data_dict in enumerate(self.gen_batch(training_data, batch_size)):
                     parameter_dict = {self.learning_rate: learning_rate, self.reg_loss_factor: reg_loss_factor,
                                       self.nloc_factor: nloc_factor,
-                                      self.gamma: gamma}
+                                      self.gamma1: gamma1,  self.gamma2: gamma2}
                     feed_dict = {**data_dict, **parameter_dict, **add_feeds}
 
                     if pretrain:
@@ -148,12 +148,12 @@ class OperationalNetwork(object):
         """
         with self.graph.as_default():
             data_dict = self.gen_data_dict(data)
-            summary = self.session.run(self.vd_summaries, feed_dict={self.reg_loss_factor: 0., self.nloc_factor: 1., self.gamma: 1., **data_dict})
+            summary = self.session.run(self.vd_summaries, feed_dict={self.reg_loss_factor: 0., self.nloc_factor: 1., self.gamma1: 0.001, self.gamma2: 0.001, **data_dict})
             self.summary_writer.add_summary(summary, global_step=self.tot_epochs)
 
             if t_data is not None:
                 data_dict = self.gen_data_dict(t_data)
-                summary_td = self.session.run(self.td_summaries, feed_dict={self.reg_loss_factor: 0., self.nloc_factor: 1., self.gamma: 1., **data_dict})
+                summary_td = self.session.run(self.td_summaries, feed_dict={self.reg_loss_factor: 0., self.nloc_factor: 1.,self.gamma1:  0.001, self.gamma2:  0.001, **data_dict})
                 self.summary_writer.add_summary(summary_td, global_step=self.tot_epochs)
 
     def run(self, data, layer, additional_params={}):
@@ -226,7 +226,8 @@ class OperationalNetwork(object):
             #######################
             # Define placeholders #
             #######################
-            self.gamma = tf.placeholder(tf.float32, shape=[], name='gamma')
+            self.gamma1 = tf.placeholder(tf.float32, shape=[], name='gamma1')
+            self.gamma2 = tf.placeholder(tf.float32, shape=[], name='gamma2')
             self.learning_rate = tf.placeholder(tf.float32, shape=[], name='learning_rate')
             self.reg_loss_factor = tf.placeholder(tf.float32, shape=[], name='reg_loss_factor')
             self.nloc_factor = tf.placeholder(tf.float32, shape=[], name='nloc_factor')
@@ -250,6 +251,10 @@ class OperationalNetwork(object):
                 for i in range(self.decoder_num)
             ]
 
+            self.select_noise_global = tf.placeholder(tf.float32, shape=[None, self.total_latent_size],
+                               name='select_noise_global')
+
+
             def fc_layer(in_layer, num_outputs, activation_fn, collection='std'):
                 return fully_connected(in_layer, num_outputs, activation_fn,
                                        weights_regularizer=l2_regularizer(1.),
@@ -272,6 +277,10 @@ class OperationalNetwork(object):
                 latent_std = tf.math.sqrt(tf.nn.moments(self.full_latent, axes=[0])[1])
                 self.select_logs = []
                 self.dec_inputs = []
+                with tf.variable_scope('select_global'):
+                    self.select_log_global = tf.get_variable('sf_log_global',
+                                                initializer=tf.initializers.constant(-10.),
+                                                shape=self.total_latent_size)
                 for n in range(self.decoder_num):
                     with tf.variable_scope('select_dec{}'.format(n)):
                         selectors = tf.get_variable('sf_log',
@@ -279,7 +288,8 @@ class OperationalNetwork(object):
                                                     shape=self.total_latent_size,
                                                     collections=[tf.GraphKeys.GLOBAL_VARIABLES, 'sel'])
                         self.select_logs.append(selectors)
-                        self.dec_inputs.append(self.full_latent + latent_std * tf.exp(selectors) * self.select_noise[n])
+                        self.dec_inputs.append(self.full_latent + latent_std * tf.exp(self.select_log_global) * self.select_noise_global +
+                                               latent_std * tf.exp(selectors) * self.select_noise[n])
 
             self.outputs = []
             for n in range(self.decoder_num):
@@ -299,15 +309,18 @@ class OperationalNetwork(object):
             with tf.name_scope('cost'):
                 sel_cost_list = []
                 ans_cost_list = []
+                sel_cost_global = tf.reduce_mean(self.select_log_global)
                 for n in range(self.decoder_num):
                     sel_cost_list.append(tf.reduce_mean(self.select_logs[n]))
                     ans_cost_list.append(tf.reduce_mean(tf.reduce_sum(tf.squared_difference(self.answers[n], self.outputs[n]), axis=1)))
 
                 self.cost_select = (-1) * tf.add_n(sel_cost_list)
+                self.cost_select_global = (-1) * sel_cost_global
                 loc_cut = int(ceil(self.decoder_num / 2))
                 self.cost_loc = tf.add_n([ans_cost_list[i] for i in range(0, loc_cut)], name='cost_local')
                 self.cost_nloc = tf.add_n([ans_cost_list[i] for i in range(loc_cut, self.decoder_num)], name='cost_local')
                 self.weighted_cost = (self.cost_loc + self.nloc_factor * self.cost_nloc) / (1. + self.nloc_factor)
+                self.total_cost = self.weighted_cost + self.gamma1 * self.cost_select + self.gamma2 * self.cost_select_global
 
             with tf.name_scope('reg_loss'):
                 self.reg_loss = tf.losses.get_regularization_loss()
@@ -316,7 +329,8 @@ class OperationalNetwork(object):
                 optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate)
 
                 self.training_op = self.train_op_from_loss(optimizer, self.weighted_cost)
-                self.pretraining_op = self.train_op_from_loss(optimizer, self.weighted_cost, collections=['std', 'loc_decoder', 'nloc_decoder'])
+                self.pretraining_op = self.train_op_from_loss(optimizer, self.weighted_cost,
+                                                              collections=['std', 'loc_decoder', 'nloc_decoder'])
 
             #########################
             # Tensorboard summaries #
@@ -339,7 +353,9 @@ class OperationalNetwork(object):
                 ])
             )
 
+            tf.summary.scalar('cost_total',self.total_cost, collections=['vd'])
             tf.summary.scalar('cost_select', self.cost_select, collections=['vd'])
+            tf.summary.scalar('cost_select_global', self.cost_select_global, collections=['vd'])
             tf.summary.scalar('cost', self.weighted_cost, collections=['vd'])
             tf.summary.scalar('cost_td', self.weighted_cost, collections=['td'])
             tf.summary.scalar('cost_loc', self.cost_loc, collections=['vd'])
@@ -349,6 +365,9 @@ class OperationalNetwork(object):
             for i in range(self.decoder_num):
                 for l in range(self.total_latent_size):
                     tf.summary.scalar('sf_log_{}_{}'.format(i, l), self.select_logs[i][l], collections=['vd'])
+
+            for l in range(self.total_latent_size):
+                tf.summary.scalar('sf_log_global_{}'.format(l), (self.select_log_global[l]), collections=['vd'])
 
             for i in range(len(self.decoder_num_units)):
                 weight_id = '' if i == 0 else '_{}'.format(i)
@@ -374,7 +393,7 @@ class OperationalNetwork(object):
         var_list = []
         for col in collections:
             var_list += tf.get_collection(col)
-        gvs = optimizer.compute_gradients(loss + self.reg_loss_factor * self.reg_loss + self.gamma * self.cost_select, var_list=var_list)
+        gvs = optimizer.compute_gradients(loss + self.reg_loss_factor * self.reg_loss + self.gamma1 * self.cost_select + self.gamma2 * self.cost_select_global, var_list=var_list)
         capped_gvs = []
         for grad, var in gvs:
             if grad is not None:
@@ -428,7 +447,7 @@ class OperationalNetwork(object):
                 data_dict[self.question_inputs[n]] = data[1][:, n]
                 data_dict[self.answers[n]] = data[2][:, n]
                 data_dict[self.select_noise[n]] = np.random.normal(size=[len(data[0]), self.total_latent_size])
-
+            data_dict[self.select_noise_global] = np.random.normal(size=[len(data[0]), self.total_latent_size])
         return data_dict
 
     def load(self, file_name):
